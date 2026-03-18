@@ -1,8 +1,8 @@
 """
 Polymarket ETH 5-Min Safe Bet - PAPER
-Analyze: T-90 to T-30 (build averages).
-Entry: Last 30s, if winning side is $0.70-$0.90 AND its avg was > $0.65, buy $10.
-TP $0.97, SL $0.60. You're buying confirmation, not speculation.
+Analyze: T-150 to T-60 (build averages).
+Entry: T-60 to close, if winning side is $0.70-$0.90 AND avg > $0.65, paper buy $10.
+TP $0.97, SL $0.60. Simulated trades, no real money.
 """
 import os
 
@@ -228,6 +228,7 @@ async def cycle(session):
     if not up_samples or not dn_samples:
         log.info("No data, skip")
         skips += 1
+        await tg(session, "SKIP: no data | %s\n%s" % (slug, stats_str()))
         now = datetime.now(timezone.utc)
         left = (end - now).total_seconds()
         if left > 0:
@@ -288,6 +289,8 @@ async def cycle(session):
                 skips += 1
                 log.info("No entry | UP avg $%.3f DN avg $%.3f | %s",
                          avg_up, avg_dn, stats_str())
+                await tg(session, "SKIP: no entry\nUP avg $%.3f DN avg $%.3f\n%s" % (
+                    avg_up, avg_dn, stats_str()))
             break
 
         # TP / SL if bought
