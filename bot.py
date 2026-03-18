@@ -22,9 +22,9 @@ RPC = os.getenv("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com")
 
 BET_SIZE = float(os.getenv("BET_SIZE", "1.0"))
 # These define when we consider there's a clear winner to bet AGAINST
-WINNER_MIN = float(os.getenv("WINNER_MIN", "0.70"))
+WINNER_MIN = float(os.getenv("WINNER_MIN", "0.60"))
 WINNER_MAX = float(os.getenv("WINNER_MAX", "0.90"))
-WINNER_AVG_MIN = float(os.getenv("WINNER_AVG_MIN", "0.65"))
+WINNER_AVG_MIN = float(os.getenv("WINNER_AVG_MIN", "0.55"))
 ANALYSIS_START = int(os.getenv("ANALYSIS_START_SECS", "150"))
 ANALYSIS_END = int(os.getenv("ANALYSIS_END_SECS", "60"))
 POLL = float(os.getenv("POLL_INTERVAL", "2.0"))
