@@ -1,9 +1,8 @@
 """
-Polymarket ETH 5-Min Contrarian - LIVE
-Analyze: T-150 to T-60 (build averages).
-If winning side avg > $0.65 and price $0.70-$0.90 (confirms a clear leader),
-buy the LOSING side for $1 at T-60. No TP, no SL. Hold to resolution.
-Betting on last-minute reversals. Track everything.
+Polymarket BTC 5-Min Copytrade Bot - LIVE
+Monitors target wallet trades on BTC 5-min markets via Data API.
+When target buys UP or DOWN, bot mirrors the same side for $1.
+No TP, no SL. Hold to resolution like the target.
 """
 import os
 _proxy = os.getenv("PROXY_URL", "")
@@ -20,32 +19,26 @@ from datetime import datetime, timezone
 
 import aiohttp
 from dotenv import load_dotenv
-from web3 import Web3
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger("eth_contra")
+log = logging.getLogger("copytrade")
 
 GAMMA = os.getenv("GAMMA_API", "https://gamma-api.polymarket.com")
 CLOB = os.getenv("CLOB_API", "https://clob.polymarket.com")
-RPC = os.getenv("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com")
+DATA_API = os.getenv("DATA_API", "https://data-api.polymarket.com")
 PK = os.getenv("POLY_PRIVATE_KEY", "")
 FUNDER = os.getenv("POLY_PROXY_ADDRESS", "")
 SIG_TYPE = int(os.getenv("POLY_SIGNATURE_TYPE", "2"))
 clob_client = None
 
-BET_SIZE = float(os.getenv("BET_SIZE", "1.0"))
-# These define when we consider there's a clear winner to bet AGAINST
-WINNER_MIN = float(os.getenv("WINNER_MIN", "0.70"))
-WINNER_MAX = float(os.getenv("WINNER_MAX", "0.90"))
-WINNER_AVG_MIN = float(os.getenv("WINNER_AVG_MIN", "0.65"))
-ANALYSIS_START = int(os.getenv("ANALYSIS_START_SECS", "150"))
-ANALYSIS_END = int(os.getenv("ANALYSIS_END_SECS", "60"))
-POLL = float(os.getenv("POLL_INTERVAL", "2.0"))
-MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS_USDC", "200.0"))
+TARGET = os.getenv("COPY_TARGET", "0xc1a65ac2f608d940c493fe22f5ed54a7b8687601")
+BET_SIZE = float(os.getenv("BET_SIZE", "3.0"))
+POLL = float(os.getenv("POLL_INTERVAL", "5.0"))
+MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS_USDC", "50.0"))
 MAX_TRADES = int(os.getenv("MAX_TRADES_PER_DAY", "200"))
 TG_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TG_CHAT_ID", "")
@@ -55,14 +48,18 @@ trades_today = 0
 last_reset = None
 wins = 0
 losses = 0
-skips = 0
-
-CL_ADDR = "0xF9680D99D6C9589e2a93a78A04A279e509205945"
-CL_ABI = json.loads('[{"inputs":[],"name":"latestRoundData","outputs":[{"name":"roundId","type":"uint80"},{"name":"answer","type":"int256"},{"name":"startedAt","type":"uint256"},{"name":"updatedAt","type":"uint256"},{"name":"answeredInRound","type":"uint80"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"stateMutability":"view","type":"function"}]')
-
+copied = 0
+seen_tx = set()  # track transaction hashes we've already processed
 
 if _proxy:
     log.info("Proxy: %s", _proxy.split("@")[-1] if "@" in _proxy else _proxy[:30])
+
+
+def trunc2(v):
+    return float(int(v * 100)) / 100.0
+
+def trunc4(v):
+    return float(int(v * 10000)) / 10000.0
 
 
 def init_clob():
@@ -100,7 +97,7 @@ def do_buy(tid, amt, price):
     bp = trunc2(price)
     shares = trunc4(amt / bp)
     if shares < 0.01:
-        return False, 0.0
+        return False
     for attempt in range(3):
         try:
             log.info("BUY: %.4f @ $%.2f ($%.2f)", shares, bp, amt)
@@ -108,7 +105,7 @@ def do_buy(tid, amt, price):
             signed = clob_client.create_order(args)
             resp = clob_client.post_order(signed, OrderType.GTC)
             log.info("BUY OK: %s", resp)
-            return True, shares
+            return True
         except Exception as e:
             emsg = str(e).lower()
             log.error("BUY #%d: %s", attempt + 1, e)
@@ -121,39 +118,22 @@ def do_buy(tid, amt, price):
                     args = OrderArgs(token_id=tid, price=bp, size=shares, side=BUY)
                     signed = clob_client.create_order(args)
                     resp = clob_client.post_order(signed, OrderType.GTC)
-                    return True, shares
+                    return True
                 except Exception:
-                    return False, 0.0
+                    return False
             else:
-                return False, 0.0
-    return False, 0.0
-
-
-def trunc2(v):
-    return float(int(v * 100)) / 100.0
-
-def trunc4(v):
-    return float(int(v * 10000)) / 10000.0
-
-def oracle():
-    try:
-        w3 = Web3(Web3.HTTPProvider(RPC))
-        c = w3.eth.contract(address=Web3.to_checksum_address(CL_ADDR), abi=CL_ABI)
-        dec = c.functions.decimals().call()
-        d = c.functions.latestRoundData().call()
-        return float(d[1]) / (10 ** dec), d[3]
-    except Exception as e:
-        log.error("Oracle: %s", e)
-        return None, None
+                return False
+    return False
 
 
 def winfo():
     now = int(time.time())
     wt = now - (now % 300)
-    return "eth-updown-5m-%d" % wt, wt, wt + 300
+    return "btc-updown-5m-%d" % wt, wt, wt + 300
 
 
-async def fetch(session, slug):
+async def fetch_market(session, slug):
+    """Get token IDs for a market slug."""
     for ep in ["/events", "/markets"]:
         try:
             async with session.get(GAMMA + ep, params={"slug": slug}) as r:
@@ -188,30 +168,31 @@ async def fetch(session, slug):
     return None, None
 
 
-async def get_price(session, tid, side="BUY"):
+async def get_price(session, tid):
     try:
-        async with session.get(CLOB + "/price", params={"token_id": tid, "side": side}) as r:
+        async with session.get(CLOB + "/price", params={"token_id": tid, "side": "BUY"}) as r:
             if r.status == 200:
                 d = await r.json()
                 if d.get("price"):
                     return float(d["price"])
     except Exception:
         pass
-    try:
-        async with session.get(CLOB + "/book", params={"token_id": tid}) as r:
-            if r.status == 200:
-                b = await r.json()
-                if side == "BUY":
-                    a = b.get("asks", [])
-                    if a:
-                        return float(a[0]["price"])
-                else:
-                    bi = b.get("bids", [])
-                    if bi:
-                        return float(bi[0]["price"])
-    except Exception:
-        pass
     return None
+
+
+async def fetch_target_trades(session):
+    """Fetch recent BTC 5-min trades from target wallet."""
+    try:
+        params = {
+            "user": TARGET,
+            "limit": 20,
+        }
+        async with session.get(DATA_API + "/trades", params=params) as r:
+            if r.status == 200:
+                return await r.json()
+    except Exception as e:
+        log.debug("Fetch trades: %s", e)
+    return []
 
 
 async def tg(session, msg):
@@ -237,219 +218,16 @@ def risk_ok():
 def stats_str():
     total = wins + losses
     rate = (wins / total * 100) if total > 0 else 0
-    return "W%d L%d S%d (%.0f%%) | PnL $%.2f" % (wins, losses, skips, rate, daily_pnl)
-
-
-async def cycle(session):
-    global daily_pnl, trades_today, wins, losses, skips
-
-    slug, ot, ct = winfo()
-    end = datetime.fromtimestamp(ct, tz=timezone.utc)
-    start = datetime.fromtimestamp(ot, tz=timezone.utc)
-    now = datetime.now(timezone.utc)
-    remaining = (end - now).total_seconds()
-
-    if remaining < ANALYSIS_END:
-        await asyncio.sleep(remaining + 2)
-        return
-
-    uid, did = await fetch(session, slug)
-    if not uid or not did:
-        log.info("No market %s", slug)
-        await asyncio.sleep(15)
-        return
-
-    if not risk_ok():
-        log.warning("Risk limit | %s", stats_str())
-        await asyncio.sleep(30)
-        return
-
-    # Wait until analysis window
-    while True:
-        now = datetime.now(timezone.utc)
-        remaining = (end - now).total_seconds()
-        if remaining <= ANALYSIS_START:
-            break
-        await asyncio.sleep(min(remaining - ANALYSIS_START, 5))
-
-    log.info("%s | Contrarian analyzing T-%d to T-%d...", slug, ANALYSIS_START, ANALYSIS_END)
-
-    # =============================================
-    # ANALYSIS: T-150 to T-60
-    # =============================================
-    up_samples = []
-    dn_samples = []
-
-    while True:
-        now = datetime.now(timezone.utc)
-        remaining = (end - now).total_seconds()
-        if remaining <= ANALYSIS_END:
-            break
-        up_p = await get_price(session, uid, "BUY")
-        dn_p = await get_price(session, did, "BUY")
-        if up_p is not None:
-            up_samples.append(up_p)
-        if dn_p is not None:
-            dn_samples.append(dn_p)
-        if up_p and dn_p:
-            log.info("  [T-%.0f] UP $%.3f DN $%.3f", remaining, up_p, dn_p)
-        await asyncio.sleep(POLL)
-
-    if not up_samples or not dn_samples:
-        log.info("No data, skip")
-        skips += 1
-        await tg(session, "SKIP: no data | %s\n%s" % (slug, stats_str()))
-        now = datetime.now(timezone.utc)
-        left = (end - now).total_seconds()
-        if left > 0:
-            await asyncio.sleep(left + 2)
-        return
-
-    avg_up = sum(up_samples) / len(up_samples)
-    avg_dn = sum(dn_samples) / len(dn_samples)
-
-    log.info("Analysis done | UP avg $%.3f (%d) | DN avg $%.3f (%d)",
-             avg_up, len(up_samples), avg_dn, len(dn_samples))
-
-    # =============================================
-    # DECIDE: is there a clear winner to bet against?
-    # =============================================
-    # Get current prices at T-60
-    up_now = await get_price(session, uid, "BUY")
-    dn_now = await get_price(session, did, "BUY")
-
-    winner_side = None
-    loser_side = None
-    loser_tok = None
-    loser_price = None
-    winner_avg = None
-    winner_price = None
-
-    # Check if UP is the clear winner
-    if (up_now is not None and WINNER_MIN <= up_now <= WINNER_MAX
-            and avg_up >= WINNER_AVG_MIN):
-        winner_side = "UP"
-        winner_avg = avg_up
-        winner_price = up_now
-        loser_side = "DOWN"
-        loser_tok = did
-        loser_price = dn_now
-
-    # Check if DOWN is the clear winner
-    elif (dn_now is not None and WINNER_MIN <= dn_now <= WINNER_MAX
-            and avg_dn >= WINNER_AVG_MIN):
-        winner_side = "DOWN"
-        winner_avg = avg_dn
-        winner_price = dn_now
-        loser_side = "UP"
-        loser_tok = uid
-        loser_price = up_now
-
-    if not winner_side or loser_price is None:
-        skips += 1
-        log.info("No clear winner | UP $%s (avg $%.3f) DN $%s (avg $%.3f) | %s",
-                 ("%.3f" % up_now) if up_now else "?", avg_up,
-                 ("%.3f" % dn_now) if dn_now else "?", avg_dn, stats_str())
-        await tg(session, "SKIP: no clear winner\nUP $%s avg $%.3f\nDN $%s avg $%.3f\n%s" % (
-            ("%.3f" % up_now) if up_now else "?", avg_up,
-            ("%.3f" % dn_now) if dn_now else "?", avg_dn, stats_str()))
-        now = datetime.now(timezone.utc)
-        left = (end - now).total_seconds()
-        if left > 0:
-            await asyncio.sleep(left + 2)
-        return
-
-    # =============================================
-    # BUY THE LOSER at any price
-    # =============================================
-    log.info("CONTRARIAN: Winner %s $%.3f (avg $%.3f) | BUY %s @ $%.3f | $%.1f | LIVE",
-             winner_side, winner_price, winner_avg, loser_side, loser_price, BET_SIZE)
-    ok, buy_shares = do_buy(loser_tok, BET_SIZE, price=loser_price)
-    if not ok:
-        skips += 1
-        log.error("BUY FAILED %s @ $%.3f", loser_side, loser_price)
-        await tg(session, "BUY FAILED %s @ $%.3f\n%s" % (loser_side, loser_price, stats_str()))
-        now = datetime.now(timezone.utc)
-        left = (end - now).total_seconds()
-        if left > 0:
-            await asyncio.sleep(left + 2)
-        return
-    buy_shares = buy_shares or trunc4(BET_SIZE / loser_price)
-    await tg(session,
-        "BUY <b>%s</b> (loser) @ $%.3f | $%.1f\nWinner: %s $%.3f avg $%.3f\nPayout if reversal: ~$%.1f\n%s" % (
-            loser_side, loser_price, BET_SIZE,
-            winner_side, winner_price, winner_avg,
-            BET_SIZE / loser_price, stats_str()))
-
-    # =============================================
-    # HOLD TO RESOLUTION — no TP, no SL
-    # =============================================
-    ll = 0
-    while True:
-        now = datetime.now(timezone.utc)
-        remaining = (end - now).total_seconds()
-        nt = int(time.time())
-
-        if remaining < 3:
-            await asyncio.sleep(remaining + 6)
-
-            fp = await get_price(session, loser_tok, "BUY")
-            if fp is not None and fp > 0.90:
-                # Loser actually won — reversal!
-                payout = buy_shares * 1.0 * 0.98
-                profit = payout - BET_SIZE
-                wins += 1
-                result = "WIN (REVERSAL!)"
-            elif fp is not None and fp < 0.10:
-                profit = -BET_SIZE
-                losses += 1
-                result = "LOSS"
-            else:
-                profit = ((fp or loser_price) - loser_price) * buy_shares
-                if profit >= 0:
-                    wins += 1
-                    result = "WIN"
-                else:
-                    losses += 1
-                    result = "LOSS"
-
-            daily_pnl += profit
-            trades_today += 1
-            log.info("%s | Bought %s @ $%.3f | Final $%s | $%.2f | %s",
-                     result, loser_side, loser_price,
-                     ("%.3f" % fp) if fp else "?", profit, stats_str())
-            await tg(session,
-                "%s\n%s @ $%.3f -> $%s\n$%.2f\n%s" % (
-                    result, loser_side, loser_price,
-                    ("%.3f" % fp) if fp else "?", profit, stats_str()))
-            break
-
-        # Just log position while waiting
-        if nt - ll >= 10:
-            cur = await get_price(session, loser_tok, "BUY")
-            cur_str = "$%.3f" % cur if cur else "?"
-            log.info("Hold %s $%.3f -> %s | %.0fs left",
-                     loser_side, loser_price, cur_str, remaining)
-            ll = nt
-
-        await asyncio.sleep(POLL)
-
-    # Next round
-    now = datetime.now(timezone.utc)
-    left = (end - now).total_seconds()
-    if left > 0:
-        await asyncio.sleep(left + 2)
-    else:
-        await asyncio.sleep(3)
+    return "Copied: %d | W%d L%d (%.0f%%) | PnL $%.2f" % (copied, wins, losses, rate, daily_pnl)
 
 
 async def main():
+    global daily_pnl, trades_today, wins, losses, copied
+
     log.info("=" * 55)
-    log.info("  ETH Contrarian [LIVE]")
-    log.info("  Analyze T-%d to T-%d", ANALYSIS_START, ANALYSIS_END)
-    log.info("  If winner $%.2f-$%.2f avg>=$%.2f -> buy LOSER $%.1f",
-             WINNER_MIN, WINNER_MAX, WINNER_AVG_MIN, BET_SIZE)
-    log.info("  No TP, no SL. Hold to resolution.")
+    log.info("  Copytrade Bot [LIVE]")
+    log.info("  Target: %s", TARGET)
+    log.info("  Bet: $%.1f | Poll: %.0fs", BET_SIZE, POLL)
     log.info("  Proxy: %s | Sig: %d", "YES" if _proxy else "NO", SIG_TYPE)
     log.info("=" * 55)
 
@@ -462,21 +240,160 @@ async def main():
         connector=aiohttp.TCPConnector(keepalive_timeout=120, limit=20),
     ) as session:
         await tg(session,
-            "ETH Contrarian LIVE\nT-%d to T-%d | Winner $%.2f-$%.2f avg>=$%.2f\nBuy LOSER $%.1f | Hold to resolution" % (
-                ANALYSIS_START, ANALYSIS_END, WINNER_MIN, WINNER_MAX, WINNER_AVG_MIN, BET_SIZE))
-        cycle_errors = 0
+            "Copytrade LIVE\nTarget: %s\n$%.1f bets | Poll %ds" % (
+                TARGET[:10] + "..." + TARGET[-6:], BET_SIZE, int(POLL)))
+
+        # Track which markets we've already traded this window
+        traded_windows = set()
+        ll = 0
+        conn_errors = 0
+
         while True:
             try:
-                await cycle(session)
-                cycle_errors = 0
+                nt = int(time.time())
+                slug, wt, ct = winfo()
+                remaining = ct - nt
+
+                # Reset traded_windows for new 5-min window
+                if wt not in traded_windows or len(traded_windows) > 100:
+                    # Prune old windows
+                    traded_windows = {w for w in traded_windows if w >= wt - 600}
+
+                # Don't trade in last 5 seconds (resolution imminent)
+                if remaining < 5:
+                    await asyncio.sleep(remaining + 2)
+                    continue
+
+                # Fetch target's recent trades
+                trades = await fetch_target_trades(session)
+                if not trades:
+                    if nt - ll >= 30:
+                        log.info("No target trades | %s | %.0fs left", slug, remaining)
+                        ll = nt
+                    await asyncio.sleep(POLL)
+                    conn_errors = 0
+                    continue
+
+                # Filter for BTC 5-min trades we haven't seen
+                for trade in trades:
+                    tx_hash = trade.get("transactionHash", "")
+                    if not tx_hash or tx_hash in seen_tx:
+                        continue
+
+                    event_slug = trade.get("eventSlug", "") or trade.get("slug", "")
+                    if "btc-updown-5m" not in event_slug:
+                        seen_tx.add(tx_hash)
+                        continue
+
+                    side = trade.get("side", "")
+                    if side != "BUY":
+                        seen_tx.add(tx_hash)
+                        continue
+
+                    outcome = (trade.get("outcome", "") or "").lower()
+                    target_price = trade.get("price", 0)
+                    target_size = trade.get("size", 0)
+                    asset = trade.get("asset", "")
+
+                    seen_tx.add(tx_hash)
+
+                    # Determine if this is for current or next window
+                    # Extract timestamp from slug
+                    trade_slug = event_slug
+                    try:
+                        trade_ts = int(trade_slug.split("-")[-1])
+                    except (ValueError, IndexError):
+                        trade_ts = wt
+
+                    # Skip if we already traded this window
+                    if trade_ts in traded_windows:
+                        continue
+
+                    # Determine side
+                    if "up" in outcome or "yes" in outcome:
+                        pick_side = "UP"
+                    elif "down" in outcome or "no" in outcome:
+                        pick_side = "DOWN"
+                    else:
+                        log.info("Unknown outcome: %s", outcome)
+                        continue
+
+                    if not risk_ok():
+                        log.warning("Risk limit | %s", stats_str())
+                        continue
+
+                    # Get the market tokens
+                    market_slug = "btc-updown-5m-%d" % trade_ts
+                    uid, did = await fetch_market(session, market_slug)
+                    if not uid or not did:
+                        log.error("Can't find market %s", market_slug)
+                        continue
+
+                    # Pick token
+                    buy_tid = uid if pick_side == "UP" else did
+
+                    # Get current price
+                    cur_price = await get_price(session, buy_tid)
+                    if cur_price is None or cur_price <= 0:
+                        log.error("No price for %s %s", pick_side, market_slug)
+                        continue
+
+                    # Copy the trade
+                    log.info("COPY: Target bought %s @ $%.3f ($%.1f) | We buy %s @ $%.3f ($%.1f)",
+                             pick_side, target_price, target_size, pick_side, cur_price, BET_SIZE)
+
+                    ok = do_buy(buy_tid, BET_SIZE, price=cur_price)
+                    if ok:
+                        copied += 1
+                        traded_windows.add(trade_ts)
+                        await tg(session,
+                            "COPY <b>%s</b> @ $%.3f | $%.1f\nTarget: %s @ $%.3f ($%.1f)\nMarket: %s\n%s" % (
+                                pick_side, cur_price, BET_SIZE,
+                                pick_side, target_price, target_size,
+                                market_slug, stats_str()))
+                    else:
+                        log.error("BUY FAILED %s @ $%.3f", pick_side, cur_price)
+                        await tg(session, "COPY FAILED %s @ $%.3f\n%s" % (
+                            pick_side, cur_price, stats_str()))
+
+                # Check resolutions for windows we traded
+                if traded_windows:
+                    for tw in list(traded_windows):
+                        tw_end = tw + 300
+                        if nt > tw_end + 10:
+                            # Window resolved, check result
+                            res_slug = "btc-updown-5m-%d" % tw
+                            res_uid, res_did = await fetch_market(session, res_slug)
+                            if res_uid:
+                                up_p = await get_price(session, res_uid)
+                                dn_p = await get_price(session, res_did) if res_did else None
+                                if up_p is not None and up_p > 0.90:
+                                    winner = "UP"
+                                elif dn_p is not None and dn_p > 0.90:
+                                    winner = "DOWN"
+                                else:
+                                    winner = "?"
+                                # We don't know exactly which side we bought for this window
+                                # without more state tracking, so just log it
+                                log.info("Resolved %s | Winner: %s", res_slug, winner)
+                            traded_windows.discard(tw)
+
+                if nt - ll >= 30:
+                    log.info("Watching %s... | %.0fs left | seen %d tx | %s",
+                             TARGET[:10], remaining, len(seen_tx), stats_str())
+                    ll = nt
+
+                conn_errors = 0
+                await asyncio.sleep(POLL)
+
             except KeyboardInterrupt:
                 break
             except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError, OSError) as e:
-                cycle_errors += 1
-                log.warning("Conn #%d: %s", cycle_errors, e)
-                if cycle_errors >= 3:
+                conn_errors += 1
+                log.warning("Conn #%d: %s", conn_errors, e)
+                if conn_errors >= 3:
                     init_clob()
-                    cycle_errors = 0
+                    conn_errors = 0
                 await asyncio.sleep(10)
             except Exception as e:
                 log.error("Error: %s", e)
