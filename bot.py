@@ -1,16 +1,29 @@
 """
-Polymarket ETH 5-Min Contrarian - PAPER
+Polymarket ETH 5-Min Contrarian - LIVE
 Analyze: T-150 to T-60 (build averages).
 If winning side avg > $0.65 and price $0.70-$0.90 (confirms a clear leader),
 buy the LOSING side for $1 at T-60. No TP, no SL. Hold to resolution.
 Betting on last-minute reversals. Track everything.
 """
-import os, sys, json, time, asyncio, logging, traceback
+import os
+_proxy = os.getenv("PROXY_URL", "")
+if _proxy:
+    os.environ["HTTP_PROXY"] = _proxy
+    os.environ["HTTPS_PROXY"] = _proxy
+    os.environ["ALL_PROXY"] = _proxy
+    os.environ["http_proxy"] = _proxy
+    os.environ["https_proxy"] = _proxy
+    os.environ["all_proxy"] = _proxy
+
+import sys, json, time, asyncio, logging, traceback
 from datetime import datetime, timezone
 
 import aiohttp
 from dotenv import load_dotenv
 from web3 import Web3
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.order_builder.constants import BUY
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S")
@@ -19,12 +32,16 @@ log = logging.getLogger("eth_contra")
 GAMMA = os.getenv("GAMMA_API", "https://gamma-api.polymarket.com")
 CLOB = os.getenv("CLOB_API", "https://clob.polymarket.com")
 RPC = os.getenv("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com")
+PK = os.getenv("POLY_PRIVATE_KEY", "")
+FUNDER = os.getenv("POLY_PROXY_ADDRESS", "")
+SIG_TYPE = int(os.getenv("POLY_SIGNATURE_TYPE", "2"))
+clob_client = None
 
 BET_SIZE = float(os.getenv("BET_SIZE", "1.0"))
 # These define when we consider there's a clear winner to bet AGAINST
-WINNER_MIN = float(os.getenv("WINNER_MIN", "0.60"))
+WINNER_MIN = float(os.getenv("WINNER_MIN", "0.70"))
 WINNER_MAX = float(os.getenv("WINNER_MAX", "0.90"))
-WINNER_AVG_MIN = float(os.getenv("WINNER_AVG_MIN", "0.55"))
+WINNER_AVG_MIN = float(os.getenv("WINNER_AVG_MIN", "0.65"))
 ANALYSIS_START = int(os.getenv("ANALYSIS_START_SECS", "150"))
 ANALYSIS_END = int(os.getenv("ANALYSIS_END_SECS", "60"))
 POLL = float(os.getenv("POLL_INTERVAL", "2.0"))
@@ -42,6 +59,74 @@ skips = 0
 
 CL_ADDR = "0xF9680D99D6C9589e2a93a78A04A279e509205945"
 CL_ABI = json.loads('[{"inputs":[],"name":"latestRoundData","outputs":[{"name":"roundId","type":"uint80"},{"name":"answer","type":"int256"},{"name":"startedAt","type":"uint256"},{"name":"updatedAt","type":"uint256"},{"name":"answeredInRound","type":"uint80"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"stateMutability":"view","type":"function"}]')
+
+
+if _proxy:
+    log.info("Proxy: %s", _proxy.split("@")[-1] if "@" in _proxy else _proxy[:30])
+
+
+def init_clob():
+    global clob_client
+    if not PK:
+        log.error("POLY_PRIVATE_KEY required")
+        return False
+    pk = PK[2:] if PK.startswith("0x") else PK
+    try:
+        if FUNDER:
+            clob_client = ClobClient(host=CLOB, key=pk, chain_id=137, signature_type=SIG_TYPE, funder=FUNDER)
+        else:
+            clob_client = ClobClient(host=CLOB, key=pk, chain_id=137)
+        clob_client.set_api_creds(clob_client.create_or_derive_api_creds())
+        if _proxy:
+            try:
+                import httpx
+                import py_clob_client.http_helpers.helpers as helpers
+                proxied = httpx.Client(http2=True, proxy=_proxy, timeout=120.0)
+                for an in dir(helpers):
+                    ob = getattr(helpers, an, None)
+                    if isinstance(ob, httpx.Client):
+                        setattr(helpers, an, proxied)
+            except Exception:
+                pass
+        log.info("CLOB OK | Sig:%d", SIG_TYPE)
+        return True
+    except Exception as e:
+        log.error("CLOB: %s", e)
+        return False
+
+
+def do_buy(tid, amt, price):
+    amt = trunc2(amt)
+    bp = trunc2(price)
+    shares = trunc4(amt / bp)
+    if shares < 0.01:
+        return False, 0.0
+    for attempt in range(3):
+        try:
+            log.info("BUY: %.4f @ $%.2f ($%.2f)", shares, bp, amt)
+            args = OrderArgs(token_id=tid, price=bp, size=shares, side=BUY)
+            signed = clob_client.create_order(args)
+            resp = clob_client.post_order(signed, OrderType.GTC)
+            log.info("BUY OK: %s", resp)
+            return True, shares
+        except Exception as e:
+            emsg = str(e).lower()
+            log.error("BUY #%d: %s", attempt + 1, e)
+            if "timeout" in emsg or "connection" in emsg:
+                init_clob()
+                time.sleep(2)
+            elif "decimal" in emsg or "accuracy" in emsg:
+                shares = trunc2(amt / bp)
+                try:
+                    args = OrderArgs(token_id=tid, price=bp, size=shares, side=BUY)
+                    signed = clob_client.create_order(args)
+                    resp = clob_client.post_order(signed, OrderType.GTC)
+                    return True, shares
+                except Exception:
+                    return False, 0.0
+            else:
+                return False, 0.0
+    return False, 0.0
 
 
 def trunc2(v):
@@ -277,9 +362,19 @@ async def cycle(session):
     # =============================================
     # BUY THE LOSER at any price
     # =============================================
-    buy_shares = trunc4(BET_SIZE / loser_price)
-    log.info("CONTRARIAN: Winner %s $%.3f (avg $%.3f) | BUY %s @ $%.3f | $%.1f | PAPER",
+    log.info("CONTRARIAN: Winner %s $%.3f (avg $%.3f) | BUY %s @ $%.3f | $%.1f | LIVE",
              winner_side, winner_price, winner_avg, loser_side, loser_price, BET_SIZE)
+    ok, buy_shares = do_buy(loser_tok, BET_SIZE, price=loser_price)
+    if not ok:
+        skips += 1
+        log.error("BUY FAILED %s @ $%.3f", loser_side, loser_price)
+        await tg(session, "BUY FAILED %s @ $%.3f\n%s" % (loser_side, loser_price, stats_str()))
+        now = datetime.now(timezone.utc)
+        left = (end - now).total_seconds()
+        if left > 0:
+            await asyncio.sleep(left + 2)
+        return
+    buy_shares = buy_shares or trunc4(BET_SIZE / loser_price)
     await tg(session,
         "BUY <b>%s</b> (loser) @ $%.3f | $%.1f\nWinner: %s $%.3f avg $%.3f\nPayout if reversal: ~$%.1f\n%s" % (
             loser_side, loser_price, BET_SIZE,
@@ -350,20 +445,24 @@ async def cycle(session):
 
 async def main():
     log.info("=" * 55)
-    log.info("  ETH Contrarian [PAPER]")
+    log.info("  ETH Contrarian [LIVE]")
     log.info("  Analyze T-%d to T-%d", ANALYSIS_START, ANALYSIS_END)
     log.info("  If winner $%.2f-$%.2f avg>=$%.2f -> buy LOSER $%.1f",
              WINNER_MIN, WINNER_MAX, WINNER_AVG_MIN, BET_SIZE)
     log.info("  No TP, no SL. Hold to resolution.")
-    log.info("  Mode: PAPER")
+    log.info("  Proxy: %s | Sig: %d", "YES" if _proxy else "NO", SIG_TYPE)
     log.info("=" * 55)
+
+    if not init_clob():
+        log.error("CLOB failed")
+        sys.exit(1)
 
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=300, connect=30, sock_read=60),
         connector=aiohttp.TCPConnector(keepalive_timeout=120, limit=20),
     ) as session:
         await tg(session,
-            "ETH Contrarian PAPER\nT-%d to T-%d | Winner $%.2f-$%.2f avg>=$%.2f\nBuy LOSER $%.1f | Hold to resolution" % (
+            "ETH Contrarian LIVE\nT-%d to T-%d | Winner $%.2f-$%.2f avg>=$%.2f\nBuy LOSER $%.1f | Hold to resolution" % (
                 ANALYSIS_START, ANALYSIS_END, WINNER_MIN, WINNER_MAX, WINNER_AVG_MIN, BET_SIZE))
         cycle_errors = 0
         while True:
@@ -375,6 +474,9 @@ async def main():
             except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError, OSError) as e:
                 cycle_errors += 1
                 log.warning("Conn #%d: %s", cycle_errors, e)
+                if cycle_errors >= 3:
+                    init_clob()
+                    cycle_errors = 0
                 await asyncio.sleep(10)
             except Exception as e:
                 log.error("Error: %s", e)
